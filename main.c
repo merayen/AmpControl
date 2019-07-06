@@ -41,7 +41,7 @@
  * RA4              R       in      Power-button input
  * RA5/AN4/DAC2     DAC     out     Fan speed heat sinks Ch0+Ch1
  * RA6              R       in      Enable bridge mode (2CO relay changing ch0+ch1 ground to ch2+ch3, and 2CO signal relay changes to 180 degree phase shift opamp)
- * RA7              R       out     Channel ch0+1 output power relay
+ * RA7              R       out     Bridge enable output (Ch2+Ch3 switch over to ground on Ch0 and Ch1, and 2CO signal relay for 180 phase shift via op-amp)
  * RB0/AN12         AN      in      Heat sink temperature amp ch0
  * RB1/AN10         AN      in      Heat sink temperature amp ch1
  * RB2/AN8/DAC3     DAC     out     Fan speed heat sinks Ch2+Ch3
@@ -52,8 +52,8 @@
  * RB7              R       out     Mini powersupply live relay
  * RC0              R       out     Main powersupply power relay
  * RC1              R       out     Main powersupply live relay
- * RC2              R       out     Channel ch2+3 output power relay
- * RC3              R       out     Bridge enable output (Ch2+Ch3 switch over to ground on Ch0 and Ch1, and 2CO signal relay for 180 phase shift via op-amp)
+ * RC2              R       out     Channel ch0+1 output power relay
+ * RC3              R       out     Channel ch2+3 output power relay
  * RC4              R       in      Oscillation detected input (shuts off amp)
  * RC5              R       in      Offset detected (shuts off amp)
  * RC6              R       in      Clip input Ch0+1
@@ -143,7 +143,7 @@ static long rounds = 0;
 /* Timers */
 #define TIMER_COUNT 4
 
-#define SLOW_START_TIMER 0
+#define MAIN_STATE_CHANGE_TIMER 0 // Timer used when changing states
 #define TIMER_ADC_ACQUISITION 1
 #define TIMER_CLIP_CH0_CH1 2
 #define TIMER_CLIP_CH2_CH3 3
@@ -199,7 +199,8 @@ static long rounds = 0;
 /* General configuration*/
 #define VOLUME_HYSTERESIS 1 // PIC won't change the volume if the potensiometer is inside this range (0 - 255)
 #define VOLUME_MAX_DIFFERENCE 8 // PIC won't change the volume if potensiometer suddenly varies more than this (0 - 255)
-#define VOLUME_LIMIT_HIGH 212 // Absolute max volume that will be sent to the PGA2310s. Formula: (-96dB + 0.5 * volume) * min_signal_voltage * amp_gain = (-96dB + 0.5 * 212) * 0.2V * 20 = 40V
+#define VOLUME_LIMIT_LOW 184 // Absolute max volume that will be sent to the PGA2310s with 160VA/12Vx2 transformer. Formula in Python: (lambda Vsignal, gain, Vout: (log(Vout/(Vsignal*gain)) / log(10) + 9.6) * 20)(1, 1, 10**3.15) --> 255
+#define VOLUME_LIMIT_HIGH 212 // Absolute max volume that will be sent to the PGA2310s with 630VA/24VAx2 transformer.
 #define CLIP_MINIMAL_VOLUME_BEFORE_SHUTOFF 180 // 180 == -6dB. If we still clip here, something is wrong with the amp. Shut off
 #define CLIP_VOLUME_REDUCTION_WAIT 100 // How many ms to wait until next reduction of volume due to clipping
 #define TIMER_ADC_ACQUISITION_MS 10 // 10 ms is overkill, but whatevs
@@ -210,8 +211,13 @@ static long rounds = 0;
 struct {
     unsigned main               :4; // Main state of amp
     unsigned failure            :6; // If any failure (see Failure Codes)
-    unsigned bridged            :1; // Set if amp is bridged
+    unsigned bridged            :1; // Set if amp should be bridged
     unsigned power_button       :1; // If 1, power button is on
+    struct {
+        unsigned requiring_high  :1; // High power is required (volume is above VOLUME_LIMIT_LOW)
+        unsigned low_stable     :1; // Power from mini transformer is stable and ready 
+        unsigned high_stable    :1; // Power from main transformer is stable and ready
+    } power;
 } state;
 
 
@@ -222,20 +228,21 @@ struct {
 
 } values;
 
+
 struct {
     struct {
         // Targeted volume. Can be set anytime. Will automatically get sent to PGA2310s upon change
         unsigned char target;
-        
+
         // Maximum volume allowed. Is set to something below 255 if any clipping has occured.
         // Slowly raises again.
         unsigned char clip_limit;
-        
+
         // Maximum volume allowed due to temperature. Is 255 when everything is inside allowed temperature range.
         // Slowly raises back to 255 if temperature gets into allowed range again.
         unsigned char temperature_limit;
-        
-        // Maximum volume allowed due to power (as we won't allow full volume when using 160VA/12Vx2 transformer)
+
+        // Maximum volume allowed due to power (as we won't allow full volume when using the 160VA/12Vx2 transformer)
         unsigned char power_limit;
 
         // Actual volume that has been successfully sent to the PGA2310s.
@@ -272,7 +279,7 @@ struct {
 
 
 
-void __interrupt () my_little_interrupt_pony() {
+void __interrupt () my_little_interrupting_pony() {
     if (PIR1bits.TMR1IF) {
         ticks++;
         PIR1bits.TMR1IF = 0;
@@ -282,7 +289,7 @@ void __interrupt () my_little_interrupt_pony() {
 
 
 
-void init_system(void) {
+void system_init(void) {
     // 32 MHz action
     OSCCONbits.SCS = 0;
     OSCCONbits.IRCF0 = 1;
@@ -299,7 +306,7 @@ void init_system(void) {
 
 
 
-void init_time(void) {
+void time_init(void) {
     // TIMER1 configuration
     T1CONbits.TMR1CS = 0;
     T1CONbits.T1CKPS = 0;
@@ -321,7 +328,7 @@ void init_time(void) {
     }
 }
 
-void update_time(void) {
+void time_update(void) {
     int time = ticks * 8; // This really gives crap time, in milliseconds, but we don't need precision for the amp anyway
     ticks = 0; // May loose a tick if interrupted around this part, but whatever
     for (int i = 0; i < TIMER_COUNT; i++)
@@ -355,19 +362,16 @@ char timer_finished(unsigned char timer) {
 /*
  * Inits input buttons
  */
-void init_buttons(void) {
+void buttons_init(void) {
     TRISAbits.TRISA4 = 1;
     TRISAbits.TRISA6 = 1;
     ANSELAbits.ANSA4 = 0;
 }
 
-void update_buttons(void) {
+void buttons_update(void) {
     // TODO implement some delay, like 10ms
-    if (PORTAbits.RA4) { // Power-button is on
-        state.power_button = 1;
-    } else {
-        state.power_button = 0;
-    }
+    state.power_button = PORTAbits.RA4;
+    state.bridged = PORTAbits.RA6;
 }
 
 
@@ -399,7 +403,11 @@ void temperature_update(void) {
  Rail voltage monitoring
  */
 void init_voltage(void) {
-    
+    ANSELCbits.ANSC0 = 0;
+    TRISCbits.TRISC0 = 1;
+
+    ANSELCbits.ANSC1 = 0;
+    TRISCbits.TRISC1 = 1;
 }
 
 void update_voltage(void) {
@@ -415,15 +423,16 @@ void update_voltage(void) {
  */
 void init_clip(void) {
     ANSELCbits.ANSC6 = 0;
-    ANSELCbits.ANSC7 = 0;
     TRISCbits.TRISC6 = 1;
+
+    ANSELCbits.ANSC7 = 0;    
     TRISCbits.TRISC7 = 1;
 }
 
 void update_clip(void) {
     if (state.failure & FAILURE_CLIP)
         return; // We have already flagged that the amp should be turned off
-    
+
     if (state.main != MAIN_STATE_ON_LOW && state.main != MAIN_STATE_POWERON_HIGH && state.main != MAIN_STATE_ON_HIGH)
         return; // We are disabled outside these modes
 
@@ -467,8 +476,6 @@ void init_volume(void) {
         volume.lanes[i].temperature_limit = 255; // Init as "no limit"
         volume.lanes[i].power_limit = 0; // Init as "no volume allowed". This limit will be lifted when amp has powered up
     }
-
-    //volume.written = 0;
 }
 
 void update_from_volume_potentiometers(unsigned char adc_no, unsigned char lane_no) {
@@ -483,52 +490,6 @@ void update_from_volume_potentiometers(unsigned char adc_no, unsigned char lane_
     if (diff >= VOLUME_HYSTERESIS && diff <= VOLUME_MAX_DIFFERENCE)
         volume.lanes[lane_no].target = next_volume;
 }
-
-// Sends data to the PGA2310. Sends 1 bit for every call
-/*void update_volume_pga2310(void) {
-    if (volume.written == 0) { // No write operation active
-
-        // See if any of the volume variables has been changed
-        char has_changed = 0;
-        for (int i = 0; i < VOLUME_LANE_COUNT; i++)
-            if (volume.lanes[i].actual != volume.lanes[i].target)
-                has_changed = 1; // There is a change
-
-        if (has_changed == 0)
-            return; // Nothing to do
-
-        // There has been a change. We set the volume values to send
-        for (int i = 0; i < VOLUME_LANE_COUNT; i++)
-            volume.lanes[i].sending = volume.lanes[i].target;
-
-        PORTDbits.RD4 = 0; // "Enables" the PGA2310s to receive data
-    }
-
-    // If we get here, either an ongoing send operation or volume has changed
-    char lane = volume.written / 16;
-    char position = volume.written % 8;
-
-    // Set data on SDI
-    PORTDbits.RD0 = (volume.lanes[lane].sending >> (7 - position)) % 2;
-
-    // TODO do we need to wait a little?
-
-    // Do a clock 
-    PORTDbits.RD3 = 1;
-
-    volume.written++;
-    volume.written %= VOLUME_LANE_COUNT * 16; // 16 bit for each PGA2310
-
-    if (volume.written == 0) { // If successfully send all the data to the PGA2310s
-        // Update the actual volume that is now set on the PGA2310s
-        for (int i = 0; i < VOLUME_LANE_COUNT; i++) {
-            volume.lanes[i].actual = volume.lanes[i].sending;
-            volume.lanes[i].sending = 0;
-        }
-
-        PORTDbits.RD4 = 1; // Disables the PGA2310s from receiving data
-    }
-}*/
 
 // Limits volume by different limits
 void update_volume_by_limits(void) {
@@ -560,7 +521,7 @@ void update_volume_pga2310(void) {
     PORTDbits.RD3 = 0;
     PORTDbits.RD4 = 0; // "Enables" the PGA2310s to receive data
 
-    // Sends all the data directly. PIC is at 32MHz, 8M instructions per second, while PGA2310 can do 6.25MHz
+    // Sends all the data directly. PIC is at 32MHz, 8M instructions per second, while PGA2310 receive data at 6.25MHz
     // Hopefully works as long as the C-compiler doesn't optimize too much
     for (int lane = 0; lane < VOLUME_LANE_COUNT; lane++) {
         for (char channel = 0; channel < 2; channel++) {
@@ -588,7 +549,7 @@ void update_volume(void) {
         if (state.main == MAIN_STATE_ON_LOW || state.main == MAIN_STATE_POWERON_HIGH) {
             // Limit volume available when using 160VA/12Vx2 transformer and when slow-starting to the 630VA/24Vx2 transformer
             for (int lane = 0; lane < VOLUME_LANE_COUNT; lane++)
-                volume.lanes[lane].power_limit = 0;
+                volume.lanes[lane].power_limit = VOLUME_LIMIT_LOW;
         } else if (state.main == MAIN_STATE_ON_HIGH) {
             for (int lane = 0; lane < VOLUME_LANE_COUNT; lane++)
                 volume.lanes[lane].power_limit = VOLUME_LIMIT_HIGH;
@@ -605,30 +566,101 @@ void update_volume(void) {
 /*
  * Speaker control (relays)
  */
-void init_speakers(void) {
-    TRISAbits.TRISA7 = 0; // Channel Ch0+Ch1
-    PORTAbits.RA7 = 0;
+void init_relays(void) {
+    TRISBbits.TRISB6 = 0; // Mini transformer
+    LATBbits.LATB6 = 0;
 
-    TRISCbits.TRISC2 = 0; // Channel Ch2+Ch3
-    PORTCbits.RC2 = 0;
+    TRISBbits.TRISB7 = 0; // Mini transformer live
+    LATBbits.LATB7 = 0;
 
-    TRISCbits.TRISC3 = 0; // Bridge enable
-    PORTCbits.RC3 = 0;
+    TRISCbits.TRISC0 = 0; // Main transformer
+    LATCbits.LATC0 = 0;
+
+    TRISCbits.TRISC1 = 0; // Main transformer
+    LATCbits.LATC1 = 0;
+
+    TRISCbits.TRISC2 = 0; // Channel Ch0+Ch1
+    LATCbits.LATC2 = 0;
+
+    TRISCbits.TRISC3 = 0; // Channel Ch2+Ch3
+    LATCbits.LATC3 = 0;
+
+    TRISAbits.TRISA7 = 0; // Bridge enable
+    LATAbits.LATA7 = 0;
 }
 
-void update_speakers(void) {
-    if (state.main == MAIN_STATE_STANDBY || state.main == MAIN_STATE_POWERON_LOW || state.main == MAIN_STATE_FAILURE) {
-         PORTAbits.RA7 = 0;
-         PORTCbits.RC2 = 0;
-         PORTCbits.RC3 = 0; // This is probably bad. Should wait a bit until all speakers are disconnected before doing this one (e.g 180 phase shift to 0 phase shift if bridge relays are quicker than the output relays)
-    } else if (state.main == MAIN_STATE_ON_LOW || state.main == MAIN_STATE_POWERON_HIGH || state.main == MAIN_STATE_ON_HIGH) {
-        // Normal operation
-        PORTAbits.RA7 = 1;
-        PORTCbits.RC2 = 1;
-        PORTCbits.RC3 = 0; // TODO when we implement bridge-mode
+void update_relays(void) {
+    // Powering
+    if (state.main == MAIN_STATE_STANDBY || state.main == MAIN_STATE_FAILURE) {
+        // This is probably bad.
+        // Should wait a bit until all speakers are disconnected before doing this one (e.g 180 phase shift to 0 phase shift if bridge relays are quicker than the output relays)
+        LATBbits.LATB6 = 0;
+        LATBbits.LATB7 = 0;
+        LATCbits.LATC0 = 0;
+        LATCbits.LATC1 = 0;
+
+    } else if (state.main == MAIN_STATE_POWERON_LOW) {
+        LATBbits.LATB6 = 1;
+        LATBbits.LATB7 = 0;
+        LATCbits.LATC0 = 0;
+        LATCbits.LATC1 = 0;
+
+    } else if (state.main == MAIN_STATE_ON_LOW) {
+        LATBbits.LATB6 = 1;
+        LATBbits.LATB7 = 1;
+        LATCbits.LATC0 = 0;
+        LATCbits.LATC1 = 0;
+
+    } else if (state.main == MAIN_STATE_POWERON_HIGH) {
+        LATBbits.LATB6 = 1;
+        LATBbits.LATB7 = 1;
+        LATCbits.LATC0 = 1;
+        LATCbits.LATC1 = 0;
+
+    } else if (state.main == MAIN_STATE_ON_HIGH) {
+        LATBbits.LATB6 = 1;
+        LATBbits.LATB7 = 1;
+        LATCbits.LATC0 = 1;
+        LATCbits.LATC1 = 1;
+
     } else if (state.main == MAIN_STATE_POWER_DOWN) {
-        PORTAbits.RA7 = 0;
-        PORTCbits.RC2 = 0;
+        LATBbits.LATB6 = 1;
+        LATBbits.LATB7 = 0;
+        LATCbits.LATC0 = 1;
+        LATCbits.LATC1 = 0;
+    }
+
+
+    // Speaker outputs
+    if (
+        state.main == MAIN_STATE_STANDBY ||
+        state.main == MAIN_STATE_FAILURE ||
+        state.main == MAIN_STATE_POWERON_LOW
+    ) {
+        LATCbits.LATC2 = 0;
+        LATCbits.LATC3 = 0;
+
+    } else if (
+        state.main == MAIN_STATE_ON_LOW ||
+        state.main == MAIN_STATE_POWERON_HIGH ||
+        state.main == MAIN_STATE_ON_HIGH
+    ) {
+        LATCbits.LATC2 = 1;
+        // LATC3 gets updated under
+    }
+
+
+    // Bridging
+    if (state.main == MAIN_STATE_POWERON_LOW) {
+        // Only update bridge mode under powering-up
+        if (state.bridged) {
+            LATCbits.LATC3 = 0;
+            LATAbits.LATA7 = 1;
+        } else {
+            LATAbits.LATA7 = 0;
+        }
+    } else if (state.main == MAIN_STATE_STANDBY) {
+        LATAbits.LATA7 = 0;
     }
 }
 
@@ -661,44 +693,44 @@ void update_fans(void) {
 /*
  * LEDs that lights up the amp owners life
  */
-void init_leds(void) {
+void leds_init(void) {
     TRISDbits.TRISD5 = 0; // Red
     TRISDbits.TRISD6 = 0; // Green
     TRISDbits.TRISD7 = 0; // Blue
-    PORTDbits.RD5 = 0;
-    PORTDbits.RD6 = 0;
-    PORTDbits.RD7 = 0;
+    LATDbits.LATD5 = 0;
+    LATDbits.LATD6 = 0;
+    LATDbits.LATD7 = 0;
 }
 
-void update_leds(void) {
+void leds_update(void) {
     if (state.main == MAIN_STATE_STANDBY) {
-        PORTDbits.RD5 = 0;
-        PORTDbits.RD6 = 0;
-        PORTDbits.RD7 = 0;
+        LATDbits.LATD5 = 0;
+        LATDbits.LATD6 = 0;
+        LATDbits.LATD7 = 0;
     } else if (state.main == MAIN_STATE_POWERON_LOW) {
-        PORTDbits.RD5 = 1;
-        PORTDbits.RD6 = 1;
-        PORTDbits.RD7 = 0;
+        LATDbits.LATD5 = 1;
+        LATDbits.LATD6 = 1;
+        LATDbits.LATD7 = 0;
     } else if (state.main == MAIN_STATE_ON_LOW) {
-        PORTDbits.RD5 = 0;
-        PORTDbits.RD6 = 1;
-        PORTDbits.RD7 = 0;
+        LATDbits.LATD5 = 0;
+        LATDbits.LATD6 = 1;
+        LATDbits.LATD7 = 0;
     } else if (state.main == MAIN_STATE_POWERON_HIGH) {
-        PORTDbits.RD5 = 1;
-        PORTDbits.RD6 = 1;
-        PORTDbits.RD7 = 0;
+        LATDbits.LATD5 = 1;
+        LATDbits.LATD6 = 1;
+        LATDbits.LATD7 = 0;
     } else if (state.main == MAIN_STATE_ON_HIGH) {
-        PORTDbits.RD5 = 0;
-        PORTDbits.RD6 = 0;
-        PORTDbits.RD7 = 1;
+        LATDbits.LATD5 = 0;
+        LATDbits.LATD6 = 0;
+        LATDbits.LATD7 = 1;
     } else if (state.main == MAIN_STATE_POWER_DOWN) {
-        PORTDbits.RD5 = 1;
-        PORTDbits.RD6 = 1;
-        PORTDbits.RD7 = 1;
+        LATDbits.LATD5 = 1;
+        LATDbits.LATD6 = 1;
+        LATDbits.LATD7 = 1;
     } else if (state.main == MAIN_STATE_FAILURE) {
-        PORTDbits.RD5 = 1;
-        PORTDbits.RD6 = 0;
-        PORTDbits.RD7 = 0;
+        LATDbits.LATD5 = 1;
+        LATDbits.LATD6 = 0;
+        LATDbits.LATD7 = 0;
     }
 }
 
@@ -800,47 +832,68 @@ void update_adc(void) {
 
 
 /*
- * Amplifier control
+ * Amplifier control.
+ * Only this is allowed to change main.state!
  */
-void init_control(void) {
+void control_init(void) {
     state.main = MAIN_STATE_STANDBY;
     state.bridged = 0;
     state.power_button = 0;
     state.failure = 0;
 }
 
-void update_control(void) {
-    if (state.failure > 0) // If any registered failures, go to failure-mode immediately
+static long dbg_cancelled = 0;
+void control_update(void) {
+    if (state.failure) // If any registered failures, go to failure-mode immediately
         state.main = MAIN_STATE_FAILURE;
 
-    
+
     if (state.main == MAIN_STATE_STANDBY) {
         if (state.power_button) {
             // Power button is on. We need to boot up
             state.main = MAIN_STATE_POWERON_LOW;
+            timer_start(MAIN_STATE_CHANGE_TIMER, 2000);
         }
     } else if (state.main == MAIN_STATE_POWERON_LOW) {
         // Amplifier is warming up with the 160VA/12Vx2-transformer
         if (!state.power_button) { // User cancels power-on
-            state.main = MAIN_STATE_STANDBY;
+            dbg_cancelled++;
+            state.main = MAIN_STATE_POWER_DOWN;
         }
-        
+
+        if (timer_finished(MAIN_STATE_CHANGE_TIMER)) {
+            state.main = MAIN_STATE_ON_LOW;
+            timer_start(MAIN_STATE_CHANGE_TIMER, 5000);
+        }
+
     } else if (state.main == MAIN_STATE_ON_LOW) {
         if (!state.power_button) { // User cancels power-on
-            state.main = MAIN_STATE_STANDBY;
+            state.main = MAIN_STATE_POWER_DOWN;
         }
-        
+
+        if (state.power.requiring_high) { // High amount of power needed. We switch transformer
+            state.main = MAIN_STATE_POWERON_HIGH;
+        }
+
     } else if (state.main == MAIN_STATE_POWERON_HIGH) {
         if (!state.power_button) { // User cancels power-on
-            state.main = MAIN_STATE_STANDBY;
+            state.main = MAIN_STATE_POWER_DOWN;
         }
-        
+
+        if (state.power.high_stable) {
+            state.main = MAIN_STATE_ON_HIGH;
+        }
+
     } else if (state.main == MAIN_STATE_ON_HIGH) {
         if (!state.power_button) { // User cancels power-on
-            state.main = MAIN_STATE_STANDBY;
+            state.main = MAIN_STATE_POWER_DOWN;
         }
 
     } else if (state.main == MAIN_STATE_POWER_DOWN) {
+        if (timer_finished(MAIN_STATE_CHANGE_TIMER)) {
+            state.main = MAIN_STATE_STANDBY;
+            timer_start(MAIN_STATE_CHANGE_TIMER, 500);
+        }
 
     } else if (state.main == MAIN_STATE_FAILURE) {
         // Stuck here forever. User needs to unplug the device to reset state
@@ -851,31 +904,31 @@ void update_control(void) {
 
 
 void main(void) {
-    init_system();
-    init_time();
-    temperature_init();
-    init_buttons();
-    init_fans();
-    init_leds();
-    init_voltage();
-    init_clip();
-    init_volume();
-    init_speakers();
-    init_adc();
-    init_control();
+    system_init();
+    time_init();
+    //temperature_init();
+    buttons_init();
+    //init_fans();
+    leds_init();
+    //init_voltage();
+    //init_clip();
+    //init_volume();
+    //init_speakers();
+    //init_adc();
+    control_init();
 
     while (1) {
-        update_time();
-        update_adc();
-        temperature_update();
-        update_buttons();
-        update_fans();
-        update_leds();
-        update_voltage();
-        update_clip();
-        update_volume();
-        update_speakers();
-        update_control();
+        time_update();
+        //update_adc();
+        //temperature_update();
+        buttons_update();
+        //update_fans();
+        leds_update();
+        //update_voltage();
+        //update_clip();
+        //update_volume();
+        //update_speakers();
+        control_update();
 
         rounds++;
     }
