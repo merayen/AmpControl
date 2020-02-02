@@ -1,6 +1,6 @@
 /*
  * File:   main.c
- * Author: merayen
+ * Author: Einar Rosvoll
  *
  * Created on 2019/05/26, 16:43
  */
@@ -90,7 +90,7 @@ static long rounds = 0;
 // - MAIN_STATE_FAILURE if voltage doesn't raise fast enough (short-circuit, bad
 // components etc)
 // - MAIN_STATE_FAILURE if DC-offset or oscillation has been detected
-// Will automatically go to MAIN_STATE_ON_LOW when voltage has gotten high enough.
+// Will otherwise automatically go to MAIN_STATE_ON_LOW when voltage has gotten high enough.
 #define MAIN_STATE_POWERON_LOW 1
 
 // Amplifier is on and functional, using the 160VA/12Vx2-transformer.
@@ -149,14 +149,13 @@ static long rounds = 0;
 #define TIMER_CLIP_CH2_CH3 3
 
 
-
-
 /* Fans */
-#define FAN_COUNT 2
+#define FAN_COUNT 4
 
-#define FAN_INTAKE 0
-#define FAN_EXHAUST 1
-
+#define FAN_AMP0 0
+#define FAN_AMP1 1
+#define FAN_AMP2 2
+#define FAN_AMP3 3
 
 /* Volumes */
 #define VOLUME_LANE_COUNT 2
@@ -710,7 +709,7 @@ void leds_update(void) {
     } else if (state.main == MAIN_STATE_POWERON_LOW) {
         LATDbits.LATD5 = 1;
         LATDbits.LATD6 = 1;
-        LATDbits.LATD7 = 0;
+        LATDbits.LATD7 = 1;
     } else if (state.main == MAIN_STATE_ON_LOW) {
         LATDbits.LATD5 = 0;
         LATDbits.LATD6 = 1;
@@ -871,8 +870,9 @@ void control_update(void) {
             state.main = MAIN_STATE_POWER_DOWN;
         }
 
-        if (state.power.requiring_high) { // High amount of power needed. We switch transformer
+        if (state.power.requiring_high || timer_finished(MAIN_STATE_CHANGE_TIMER)) { // High amount of power needed. We switch transformer
             state.main = MAIN_STATE_POWERON_HIGH;
+			timer_start(MAIN_STATE_CHANGE_TIMER, 5000);
         }
 
     } else if (state.main == MAIN_STATE_POWERON_HIGH) {
@@ -880,7 +880,7 @@ void control_update(void) {
             state.main = MAIN_STATE_POWER_DOWN;
         }
 
-        if (state.power.high_stable) {
+        if (state.power.high_stable || timer_finished(MAIN_STATE_CHANGE_TIMER)) {
             state.main = MAIN_STATE_ON_HIGH;
         }
 
