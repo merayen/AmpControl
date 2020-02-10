@@ -36,12 +36,12 @@
  * Port designations:
  * RA0/AN0          AN      in      Amp V+ voltage
  * RA1/AN1          AN      in      Amp V- voltage
- * RA2/AN2/DAC1     DAC
+ * RA2/AN2/DAC1     DAC     ?
  * RA3/AN3          AN      ?
  * RA4              R       in      Power-button input
  * RA5/AN4/DAC2     DAC     out     Fan speed heat sinks Ch0+Ch1
  * RA6              R       in      Enable bridge mode (2CO relay changing ch0+ch1 ground to ch2+ch3, and 2CO signal relay changes to 180 degree phase shift opamp)
- * RA7              R       out     Bridge enable output (Ch2+Ch3 switch over to ground on Ch0 and Ch1, and 2CO signal relay for 180 phase shift via op-amp)
+ * RA7              R       out     Bridge enable output (Ch2+Ch3 switch over to ground on Ch0 and Ch1 outputs, and 2CO signal relay for 180 phase shift via op-amp)
  * RB0/AN12         AN      in      Heat sink temperature amp ch0
  * RB1/AN10         AN      in      Heat sink temperature amp ch1
  * RB2/AN8/DAC3     DAC     out     Fan speed heat sinks Ch2+Ch3
@@ -54,8 +54,8 @@
  * RC1              R       out     Main powersupply live relay
  * RC2              R       out     Channel ch0+1 output power relay
  * RC3              R       out     Channel ch2+3 output power relay
- * RC4              R       in      Oscillation detected input (shuts off amp)
- * RC5              R       in      Offset detected (shuts off amp)
+ * RC4              R       ?
+ * RC5              R       in      Emergency (offset, rail voltage issue, oscillation etc)
  * RC6              R       in      Clip input Ch0+1
  * RC7              R       in      Clip input Ch2+3
  * RD0              R       out     PGA2310 (SDI)
@@ -67,8 +67,8 @@
  * RD6              R       out     Power LED Green
  * RD7              R       out     Power LED Blue
  * RE0/AN5          AN      ?
- * RE1/AN6          AN      in      Volume potensiometer ch0+1?
- * RE2/AN7          AN      in      Volume potensiometer ch2+3?
+ * RE1/AN6          AN      in      Volume potensiometer ch0+1
+ * RE2/AN7          AN      in      Volume potensiometer ch2+3
  */
 
 
