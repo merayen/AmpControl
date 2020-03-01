@@ -1,3 +1,5 @@
 /build
 /dist
 *.md.html
+/nbproject
+*.swp
